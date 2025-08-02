@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -116,6 +117,15 @@ func NewStream(conn net.Conn) *Stream {
 	}
 }
 
+// Constructeur de Stream modifié pour accepter un io.Reader personnalisé pour le décodeur
+func NewStreamWithReader(conn net.Conn, reader io.Reader) *Stream {
+	return &Stream{
+		conn: conn,
+		enc:  json.NewEncoder(conn),
+		dec:  json.NewDecoder(reader),
+	}
+}
+
 func (s *Stream) Send(msg Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -225,15 +235,13 @@ func marshalMessage(data interface{}) ([]byte, error) {
 	return json.Marshal(data)
 }
 
-// --- DEBUT DES MODIFICATIONS PRINCIPALES ---
-
 // Server implementation
 type Server struct {
 	servicePort   int
 	connMgr       *ConnectionManager
 	logger        *Logger
-	controlStream *Stream      // Référence au canal de contrôle du client
-	controlMu     sync.RWMutex // Mutex pour protéger l'accès à controlStream
+	controlStream *Stream
+	controlMu     sync.RWMutex
 }
 
 func NewServer(servicePort int, logger *Logger) *Server {
@@ -244,21 +252,18 @@ func NewServer(servicePort int, logger *Logger) *Server {
 	}
 }
 
-// Définit le canal de contrôle actif
 func (s *Server) setControlStream(stream *Stream) {
 	s.controlMu.Lock()
 	defer s.controlMu.Unlock()
 	s.controlStream = stream
 }
 
-// Récupère le canal de contrôle actif
 func (s *Server) getControlStream() *Stream {
 	s.controlMu.RLock()
 	defer s.controlMu.RUnlock()
 	return s.controlStream
 }
 
-// Écoute pour les connexions de service publiques (ex: port 4040)
 func (s *Server) listenForService(ctx context.Context) error {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.servicePort))
 	if err != nil {
@@ -278,12 +283,10 @@ func (s *Server) listenForService(ctx context.Context) error {
 				continue
 			}
 		}
-
 		go s.forwardServiceConnection(conn)
 	}
 }
 
-// Transfère une nouvelle connexion de service au client via le canal de contrôle
 func (s *Server) forwardServiceConnection(incomingConn net.Conn) {
 	control := s.getControlStream()
 	if control == nil {
@@ -308,11 +311,9 @@ func (s *Server) forwardServiceConnection(incomingConn net.Conn) {
 	if err := control.Send(connMsg); err != nil {
 		incomingConn.Close()
 		s.logger.Error("Failed to send connection message to client", "error", err)
-		// Le canal de contrôle est peut-être mort, il sera nettoyé par la goroutine handleConnection
 	}
 }
 
-// Écoute pour les connexions de contrôle des clients (ex: port 8080)
 func (s *Server) listenForClients(ctx context.Context) error {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", DefaultServerPort))
 	if err != nil {
@@ -338,7 +339,6 @@ func (s *Server) listenForClients(ctx context.Context) error {
 			s.logger.Error("Accept error", "error", err)
 			continue
 		}
-
 		go s.handleConnection(conn)
 	}
 }
@@ -360,15 +360,35 @@ func (s *Server) printStats(ctx context.Context) {
 	}
 }
 
+// --- DEBUT DE LA MODIFICATION PRINCIPALE ---
+
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	stream := NewStream(conn)
 	s.logger.Connection("New potential connection", "remote_addr", conn.RemoteAddr().String())
+	
+	// Utilise un bufio.Reader pour "jeter un oeil" (Peek) aux premières données
+	// sans les consommer du flux de la connexion.
+	reader := bufio.NewReader(conn)
+	
+	// On regarde les 4 premiers octets pour détecter une requête HTTP (ex: "GET ").
+	peekedBytes, err := reader.Peek(4)
+	if err == nil && string(peekedBytes) == "GET " {
+		s.logger.Debug("Detected HTTP GET request, likely a health check. Responding with 200 OK.")
+		// Répond avec un simple 200 OK pour satisfaire le health check.
+		fmt.Fprint(conn, "HTTP/1.1 200 OK\r\n\r\n")
+		return // On ferme la connexion et on arrête le traitement.
+	}
+
+	// Si ce n'est pas une requête GET, on continue normalement.
+	// Le reader contient toujours l'intégralité du message original.
+	stream := NewStreamWithReader(conn, reader)
 
 	msg, err := stream.Recv()
 	if err != nil {
-		if err != io.EOF {
+		// On ignore les erreurs EOF qui sont normales lors de la déconnexion
+		// et les erreurs "unexpected EOF" qui peuvent arriver si un client se déconnecte abruptement.
+		if err != io.EOF && err != io.ErrUnexpectedEOF {
 			s.logger.Error("Error receiving initial message", "error", err)
 		}
 		return
@@ -384,9 +404,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
-// Gère le cycle de vie du canal de contrôle d'un client
+// --- FIN DE LA MODIFICATION PRINCIPALE ---
+
 func (s *Server) handleClientControl(stream *Stream, msg Message) {
-	// S'assure que le canal de contrôle est bien nul à la fin de la connexion
 	defer s.setControlStream(nil)
 
 	var helloData HelloData
@@ -396,7 +416,7 @@ func (s *Server) handleClientControl(stream *Stream, msg Message) {
 	}
 
 	s.logger.Info("Client control channel established", "client_port", helloData.Port)
-	s.setControlStream(stream) // Définit ce stream comme le canal de contrôle actif
+	s.setControlStream(stream)
 
 	responseData, err := marshalMessage(HelloData{Port: s.servicePort})
 	if err != nil {
@@ -410,19 +430,17 @@ func (s *Server) handleClientControl(stream *Stream, msg Message) {
 		return
 	}
 
-	// Boucle pour détecter la déconnexion du client
 	for {
-		// On lit simplement du stream. Quand le client se déconnecte,
-		// Recv() retournera une erreur (généralement io.EOF).
 		if _, err := stream.Recv(); err != nil {
-			s.logger.Info("Client control channel disconnected", "error", err)
-			// Le 'defer' s'occupera de mettre controlStream à nil
+			if err != io.EOF {
+				s.logger.Info("Client control channel disconnected", "error", err)
+			} else {
+				s.logger.Info("Client control channel disconnected gracefully")
+			}
 			return
 		}
 	}
 }
-
-// --- FIN DES MODIFICATIONS PRINCIPALES ---
 
 func (s *Server) handleAccept(stream *Stream, msg Message) {
 	var acceptData ConnectionData
@@ -441,7 +459,7 @@ func (s *Server) handleAccept(stream *Stream, msg Message) {
 	}
 }
 
-// Client implementation (inchangé)
+// Client implementation
 type Client struct {
 	localPort  int
 	serverAddr string
@@ -518,8 +536,6 @@ func (c *Client) listen(ctx context.Context, stream *Stream) error {
 		if err != nil {
 			if err == io.EOF {
 				c.logger.Info("Server disconnected. Will attempt to reconnect...")
-				// Retourner nil ici permet au processus client de se terminer,
-				// et si lancé dans une boucle, de retenter la connexion.
 				return nil
 			}
 			return fmt.Errorf("failed to receive message: %v", err)
@@ -531,7 +547,6 @@ func (c *Client) listen(ctx context.Context, stream *Stream) error {
 				c.logger.Error("Invalid connection data", "error", err)
 				continue
 			}
-
 			go c.handleConnection(ctx, connData.ID)
 		}
 	}
@@ -605,15 +620,13 @@ func main() {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			// Lance l'écouteur du service public dans une goroutine séparée
 			go func() {
-				if err := server.listenForService(ctx); err != nil {
+				if err := server.listenForService(ctx); err != nil && err != context.Canceled {
 					logger.Error("Service listener failed", "error", err)
-					cancel() // Annule le contexte si l'écouteur de service échoue
+					cancel()
 				}
 			}()
 
-			// Lance l'écouteur du canal de contrôle dans la goroutine principale
 			return server.listenForClients(ctx)
 		},
 	}
@@ -630,20 +643,21 @@ func main() {
 
 			logger := NewLogger(logLevel)
 			
-			// Boucle pour permettre la reconnexion automatique du client
 			for {
 				client := NewClient(localPort, args[1], logger)
 				ctx, cancel := context.WithCancel(context.Background())
 				
 				err := client.Connect(ctx)
-				if err != nil {
+				if err != nil && err != context.Canceled {
 					logger.Error("Client error", "error", err)
 				}
 				
-				cancel() // Assure que toutes les goroutines associées sont arrêtées
+				cancel()
 				
-				logger.Info("Attempting to reconnect in 5 seconds...")
-				time.Sleep(5 * time.Second)
+				select {
+				case <-time.After(5 * time.Second):
+					logger.Info("Attempting to reconnect...")
+				}
 			}
 		},
 	}
