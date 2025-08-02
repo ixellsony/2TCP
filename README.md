@@ -54,6 +54,6 @@ main.go client [local_port] [server_address] --log-level [level]
 main.go client 443 example.com
 ```
 
-Une fois connecté, tout le trafic envoyé à l’adresse publique sera redirigé vers `localhost:8080`.
+Une fois connecté, tout le trafic envoyé à l’adresse publique sera redirigé vers `localhost:443`.
 
 En cas de déconnexion, le client tente automatiquement de se reconnecter toutes les 5 secondes.
