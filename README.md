@@ -1,7 +1,7 @@
 
 # 2TCP - Tunnel TCP
 
-![Aperçu du Dashboard](demo.png)
+![Aperçu](demo.png)
 
 Un tunnel TCP simple et efficace conçu pour fonctionner derrière un reverse proxy. Ce projet fournit un moyen de relayer le trafic TCP d'un serveur public vers un service local, même lorsque le service local se trouve derrière un NAT ou un pare-feu.
 
