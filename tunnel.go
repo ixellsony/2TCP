@@ -24,7 +24,6 @@ const (
 	StatsInterval     = 30 * time.Second
 )
 
-// Message structures
 type Message struct {
 	Type string          `json:"type"`
 	Data json.RawMessage `json:"data"`
@@ -38,7 +37,6 @@ type HelloData struct {
 	Port int `json:"port"`
 }
 
-// Optimized logger
 type Logger struct {
 	*log.Logger
 	level string
@@ -101,7 +99,6 @@ func (l *Logger) Connection(msg string, keysAndValues ...interface{}) {
 	}
 }
 
-// JSON stream handler
 type Stream struct {
 	conn net.Conn
 	enc  *json.Encoder
@@ -117,7 +114,6 @@ func NewStream(conn net.Conn) *Stream {
 	}
 }
 
-// Constructeur de Stream modifié pour accepter un io.Reader personnalisé pour le décodeur
 func NewStreamWithReader(conn net.Conn, reader io.Reader) *Stream {
 	return &Stream{
 		conn: conn,
@@ -142,7 +138,6 @@ func (s *Stream) Close() error {
 	return s.conn.Close()
 }
 
-// Connection manager with atomic operations
 type ConnectionManager struct {
 	conns      sync.Map
 	timers     sync.Map
@@ -203,7 +198,6 @@ func (cm *ConnectionManager) Stats() (int64, int64) {
 	return cm.activeConn, cm.totalConn
 }
 
-// Utility function for bidirectional copy
 func copyBidirectional(conn1, conn2 net.Conn) {
 	var wg sync.WaitGroup
 	var once sync.Once
@@ -230,12 +224,10 @@ func copyBidirectional(conn1, conn2 net.Conn) {
 	wg.Wait()
 }
 
-// Marshal with error handling
 func marshalMessage(data interface{}) ([]byte, error) {
 	return json.Marshal(data)
 }
 
-// Server implementation
 type Server struct {
 	servicePort   int
 	connMgr       *ConnectionManager
@@ -360,34 +352,26 @@ func (s *Server) printStats(ctx context.Context) {
 	}
 }
 
-// --- DEBUT DE LA MODIFICATION PRINCIPALE ---
-
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	s.logger.Connection("New potential connection", "remote_addr", conn.RemoteAddr().String())
 	
-	// Utilise un bufio.Reader pour "jeter un oeil" (Peek) aux premières données
-	// sans les consommer du flux de la connexion.
 	reader := bufio.NewReader(conn)
 	
-	// On regarde les 4 premiers octets pour détecter une requête HTTP (ex: "GET ").
 	peekedBytes, err := reader.Peek(4)
 	if err == nil && string(peekedBytes) == "GET " {
 		s.logger.Debug("Detected HTTP GET request, likely a health check. Responding with 200 OK.")
-		// Répond avec un simple 200 OK pour satisfaire le health check.
+
 		fmt.Fprint(conn, "HTTP/1.1 200 OK\r\n\r\n")
-		return // On ferme la connexion et on arrête le traitement.
+		return 
 	}
 
-	// Si ce n'est pas une requête GET, on continue normalement.
-	// Le reader contient toujours l'intégralité du message original.
 	stream := NewStreamWithReader(conn, reader)
 
 	msg, err := stream.Recv()
 	if err != nil {
-		// On ignore les erreurs EOF qui sont normales lors de la déconnexion
-		// et les erreurs "unexpected EOF" qui peuvent arriver si un client se déconnecte abruptement.
+		
 		if err != io.EOF && err != io.ErrUnexpectedEOF {
 			s.logger.Error("Error receiving initial message", "error", err)
 		}
@@ -403,8 +387,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.logger.Warn("Unknown message type", "type", msg.Type)
 	}
 }
-
-// --- FIN DE LA MODIFICATION PRINCIPALE ---
 
 func (s *Server) handleClientControl(stream *Stream, msg Message) {
 	defer s.setControlStream(nil)
@@ -459,7 +441,6 @@ func (s *Server) handleAccept(stream *Stream, msg Message) {
 	}
 }
 
-// Client implementation
 type Client struct {
 	localPort  int
 	serverAddr string
@@ -594,7 +575,6 @@ func (c *Client) handleConnection(ctx context.Context, id string) {
 	c.logger.Connection("Connection closed", "id", id[:8])
 }
 
-// CLI
 func main() {
 	var logLevel string
 
