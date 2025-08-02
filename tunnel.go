@@ -59,7 +59,7 @@ func (l *Logger) log(prefix, msg string, keysAndValues ...interface{}) {
 		l.Printf("[%s] %s", prefix, msg)
 		return
 	}
-	
+
 	var kvs string
 	for i := 0; i < len(keysAndValues); i += 2 {
 		if i+1 < len(keysAndValues) {
@@ -148,15 +148,15 @@ func NewConnectionManager(logger *Logger) *ConnectionManager {
 
 func (cm *ConnectionManager) Store(id string, conn net.Conn) {
 	cm.conns.Store(id, conn)
-	
+
 	cm.mu.Lock()
 	cm.activeConn++
 	cm.totalConn++
 	active, total := cm.activeConn, cm.totalConn
 	cm.mu.Unlock()
-	
+
 	cm.logger.Connection("Connection stored", "id", id, "active", active, "total", total)
-	
+
 	timer := time.AfterFunc(CleanupTimeout, func() {
 		if conn, exists := cm.conns.LoadAndDelete(id); exists {
 			conn.(net.Conn).Close()
@@ -165,7 +165,7 @@ func (cm *ConnectionManager) Store(id string, conn net.Conn) {
 		}
 		cm.timers.Delete(id)
 	})
-	
+
 	cm.timers.Store(id, timer)
 }
 
@@ -173,7 +173,7 @@ func (cm *ConnectionManager) LoadAndDelete(id string) (net.Conn, bool) {
 	if timer, exists := cm.timers.LoadAndDelete(id); exists {
 		timer.(*time.Timer).Stop()
 	}
-	
+
 	if conn, exists := cm.conns.LoadAndDelete(id); exists {
 		cm.decrementActive()
 		return conn.(net.Conn), true
@@ -197,7 +197,7 @@ func (cm *ConnectionManager) Stats() (int64, int64) {
 func copyBidirectional(conn1, conn2 net.Conn) {
 	var wg sync.WaitGroup
 	var once sync.Once
-	
+
 	closeConnections := func() {
 		conn1.Close()
 		conn2.Close()
@@ -225,11 +225,15 @@ func marshalMessage(data interface{}) ([]byte, error) {
 	return json.Marshal(data)
 }
 
+// --- DEBUT DES MODIFICATIONS PRINCIPALES ---
+
 // Server implementation
 type Server struct {
-	servicePort int
-	connMgr     *ConnectionManager
-	logger      *Logger
+	servicePort   int
+	connMgr       *ConnectionManager
+	logger        *Logger
+	controlStream *Stream      // Référence au canal de contrôle du client
+	controlMu     sync.RWMutex // Mutex pour protéger l'accès à controlStream
 }
 
 func NewServer(servicePort int, logger *Logger) *Server {
@@ -240,14 +244,83 @@ func NewServer(servicePort int, logger *Logger) *Server {
 	}
 }
 
-func (s *Server) Listen(ctx context.Context) error {
+// Définit le canal de contrôle actif
+func (s *Server) setControlStream(stream *Stream) {
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	s.controlStream = stream
+}
+
+// Récupère le canal de contrôle actif
+func (s *Server) getControlStream() *Stream {
+	s.controlMu.RLock()
+	defer s.controlMu.RUnlock()
+	return s.controlStream
+}
+
+// Écoute pour les connexions de service publiques (ex: port 4040)
+func (s *Server) listenForService(ctx context.Context) error {
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.servicePort))
+	if err != nil {
+		return fmt.Errorf("failed to listen on service port %d: %v", s.servicePort, err)
+	}
+	defer listener.Close()
+	s.logger.Info("Service listener running", "port", s.servicePort)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				s.logger.Error("Service accept error", "error", err)
+				continue
+			}
+		}
+
+		go s.forwardServiceConnection(conn)
+	}
+}
+
+// Transfère une nouvelle connexion de service au client via le canal de contrôle
+func (s *Server) forwardServiceConnection(incomingConn net.Conn) {
+	control := s.getControlStream()
+	if control == nil {
+		s.logger.Warn("No client control channel active. Dropping incoming connection.")
+		incomingConn.Close()
+		return
+	}
+
+	id := uuid.New().String()
+	s.logger.Connection("New tunnel connection", "id", id[:8])
+
+	s.connMgr.Store(id, incomingConn)
+
+	connData, err := marshalMessage(ConnectionData{ID: id})
+	if err != nil {
+		s.logger.Error("Failed to marshal connection data", "error", err)
+		incomingConn.Close()
+		return
+	}
+
+	connMsg := Message{Type: "connection", Data: connData}
+	if err := control.Send(connMsg); err != nil {
+		incomingConn.Close()
+		s.logger.Error("Failed to send connection message to client", "error", err)
+		// Le canal de contrôle est peut-être mort, il sera nettoyé par la goroutine handleConnection
+	}
+}
+
+// Écoute pour les connexions de contrôle des clients (ex: port 8080)
+func (s *Server) listenForClients(ctx context.Context) error {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", DefaultServerPort))
 	if err != nil {
-		return fmt.Errorf("failed to listen on port %d: %v", DefaultServerPort, err)
+		return fmt.Errorf("failed to listen on control port %d: %v", DefaultServerPort, err)
 	}
 	defer listener.Close()
 
-	s.logger.Info("Server listening", "port", DefaultServerPort)
+	s.logger.Info("Control server listening", "port", DefaultServerPort)
 
 	if s.logger.level == "debug" {
 		go s.printStats(ctx)
@@ -266,14 +339,14 @@ func (s *Server) Listen(ctx context.Context) error {
 			continue
 		}
 
-		go s.handleConnection(ctx, conn)
+		go s.handleConnection(conn)
 	}
 }
 
 func (s *Server) printStats(ctx context.Context) {
 	ticker := time.NewTicker(StatsInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -287,21 +360,23 @@ func (s *Server) printStats(ctx context.Context) {
 	}
 }
 
-func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
+func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
-	
+
 	stream := NewStream(conn)
-	s.logger.Connection("New connection", "remote_addr", conn.RemoteAddr().String())
+	s.logger.Connection("New potential connection", "remote_addr", conn.RemoteAddr().String())
 
 	msg, err := stream.Recv()
 	if err != nil {
-		s.logger.Error("Error receiving message", "error", err)
+		if err != io.EOF {
+			s.logger.Error("Error receiving initial message", "error", err)
+		}
 		return
 	}
 
 	switch msg.Type {
 	case "hello":
-		s.handleClient(ctx, stream, msg)
+		s.handleClientControl(stream, msg)
 	case "accept":
 		s.handleAccept(stream, msg)
 	default:
@@ -309,76 +384,45 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (s *Server) handleClient(ctx context.Context, stream *Stream, msg Message) {
+// Gère le cycle de vie du canal de contrôle d'un client
+func (s *Server) handleClientControl(stream *Stream, msg Message) {
+	// S'assure que le canal de contrôle est bien nul à la fin de la connexion
+	defer s.setControlStream(nil)
+
 	var helloData HelloData
 	if err := json.Unmarshal(msg.Data, &helloData); err != nil {
 		s.logger.Error("Invalid hello data", "error", err)
 		return
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.servicePort))
-	if err != nil {
-		s.logger.Error("Failed to create listener", "port", s.servicePort, "error", err)
-		return
-	}
-	defer listener.Close()
-
-	s.logger.Info("Tunnel established", 
-		"service_port", s.servicePort, 
-		"client_port", helloData.Port)
+	s.logger.Info("Client control channel established", "client_port", helloData.Port)
+	s.setControlStream(stream) // Définit ce stream comme le canal de contrôle actif
 
 	responseData, err := marshalMessage(HelloData{Port: s.servicePort})
 	if err != nil {
 		s.logger.Error("Failed to marshal response data", "error", err)
 		return
 	}
-	
+
 	response := Message{Type: "hello", Data: responseData}
 	if err := stream.Send(response); err != nil {
 		s.logger.Error("Failed to send hello response", "error", err)
 		return
 	}
 
+	// Boucle pour détecter la déconnexion du client
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		if tcpListener, ok := listener.(*net.TCPListener); ok {
-			tcpListener.SetDeadline(time.Now().Add(1 * time.Second))
-		}
-		
-		incomingConn, err := listener.Accept()
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			s.logger.Error("Listener error", "error", err)
-			return
-		}
-
-		id := uuid.New().String()
-		s.logger.Connection("New tunnel connection", "id", id[:8])
-
-		s.connMgr.Store(id, incomingConn)
-
-		connData, err := marshalMessage(ConnectionData{ID: id})
-		if err != nil {
-			s.logger.Error("Failed to marshal connection data", "error", err)
-			incomingConn.Close()
-			continue
-		}
-		
-		connMsg := Message{Type: "connection", Data: connData}
-		if err := stream.Send(connMsg); err != nil {
-			incomingConn.Close()
-			s.logger.Error("Failed to send connection message", "error", err)
+		// On lit simplement du stream. Quand le client se déconnecte,
+		// Recv() retournera une erreur (généralement io.EOF).
+		if _, err := stream.Recv(); err != nil {
+			s.logger.Info("Client control channel disconnected", "error", err)
+			// Le 'defer' s'occupera de mettre controlStream à nil
 			return
 		}
 	}
 }
+
+// --- FIN DES MODIFICATIONS PRINCIPALES ---
 
 func (s *Server) handleAccept(stream *Stream, msg Message) {
 	var acceptData ConnectionData
@@ -397,7 +441,7 @@ func (s *Server) handleAccept(stream *Stream, msg Message) {
 	}
 }
 
-// Client implementation
+// Client implementation (inchangé)
 type Client struct {
 	localPort  int
 	serverAddr string
@@ -416,7 +460,7 @@ func NewClient(localPort int, serverAddr string, logger *Logger) *Client {
 
 func (c *Client) Connect(ctx context.Context) error {
 	address := fmt.Sprintf("%s:%d", c.serverAddr, DefaultServerPort)
-	
+
 	conn, err := net.DialTimeout("tcp", address, NetworkTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to connect to server: %v", err)
@@ -429,7 +473,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		stream.Close()
 		return fmt.Errorf("failed to marshal hello data: %v", err)
 	}
-	
+
 	hello := Message{Type: "hello", Data: helloData}
 	if err := stream.Send(hello); err != nil {
 		stream.Close()
@@ -473,7 +517,9 @@ func (c *Client) listen(ctx context.Context, stream *Stream) error {
 		msg, err := stream.Recv()
 		if err != nil {
 			if err == io.EOF {
-				c.logger.Info("Server disconnected")
+				c.logger.Info("Server disconnected. Will attempt to reconnect...")
+				// Retourner nil ici permet au processus client de se terminer,
+				// et si lancé dans une boucle, de retenter la connexion.
 				return nil
 			}
 			return fmt.Errorf("failed to receive message: %v", err)
@@ -500,7 +546,7 @@ func (c *Client) handleConnection(ctx context.Context, id string) {
 	c.logger.Connection("Handling connection", "id", id[:8], "count", count)
 
 	address := fmt.Sprintf("%s:%d", c.serverAddr, DefaultServerPort)
-	
+
 	serverConn, err := net.DialTimeout("tcp", address, NetworkTimeout)
 	if err != nil {
 		c.logger.Error("Failed to connect to server", "error", err)
@@ -515,7 +561,7 @@ func (c *Client) handleConnection(ctx context.Context, id string) {
 		c.logger.Error("Failed to marshal accept data", "error", err)
 		return
 	}
-	
+
 	accept := Message{Type: "accept", Data: acceptData}
 	if err := serverStream.Send(accept); err != nil {
 		c.logger.Error("Failed to send accept", "error", err)
@@ -540,12 +586,12 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:   "tunnel",
 		Short: "A TCP tunnel application",
-		Long:  "A simple and efficient TCP tunnel application designed to work behind Caddy",
+		Long:  "A simple and efficient TCP tunnel application designed to work behind a reverse proxy.",
 	}
 
 	serverCmd := &cobra.Command{
 		Use:   "server [service_port]",
-		Short: "Run as server (designed to work behind Caddy reverse proxy)",
+		Short: "Run as server",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			servicePort, err := strconv.Atoi(args[0])
@@ -555,11 +601,20 @@ func main() {
 
 			logger := NewLogger(logLevel)
 			server := NewServer(servicePort, logger)
-			
+
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			return server.Listen(ctx)
+			// Lance l'écouteur du service public dans une goroutine séparée
+			go func() {
+				if err := server.listenForService(ctx); err != nil {
+					logger.Error("Service listener failed", "error", err)
+					cancel() // Annule le contexte si l'écouteur de service échoue
+				}
+			}()
+
+			// Lance l'écouteur du canal de contrôle dans la goroutine principale
+			return server.listenForClients(ctx)
 		},
 	}
 
@@ -574,12 +629,22 @@ func main() {
 			}
 
 			logger := NewLogger(logLevel)
-			client := NewClient(localPort, args[1], logger)
 			
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			return client.Connect(ctx)
+			// Boucle pour permettre la reconnexion automatique du client
+			for {
+				client := NewClient(localPort, args[1], logger)
+				ctx, cancel := context.WithCancel(context.Background())
+				
+				err := client.Connect(ctx)
+				if err != nil {
+					logger.Error("Client error", "error", err)
+				}
+				
+				cancel() // Assure que toutes les goroutines associées sont arrêtées
+				
+				logger.Info("Attempting to reconnect in 5 seconds...")
+				time.Sleep(5 * time.Second)
+			}
 		},
 	}
 
