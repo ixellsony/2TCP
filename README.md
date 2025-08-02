@@ -13,53 +13,14 @@ Un tunnel TCP simple et efficace conçu pour fonctionner derrière un reverse pr
 - **Journalisation Configurable** : Niveaux de log ajustables (`debug`, `info`, `warn`, `error`) pour le développement et la production.
 - **Détection de Health Check** : Le serveur peut répondre aux requêtes HTTP GET de base (comme les health checks des reverse proxies) sans interrompre la connexion de tunnel.
 
-## ⚙️ Comment ça marche
-
-L'application se compose de deux parties : un **serveur** et un **client**.
-
-### Le Client
-
-- S'exécute sur la même machine ou le même réseau que le service que vous souhaitez exposer (ex: un serveur web local sur le port 3000).
-- Établit une connexion de contrôle persistante avec le **serveur**.
-
-### Le Serveur
-
-- S'exécute sur une machine accessible publiquement (ex: un VPS).
-- Il écoute sur deux ports :
-  - **Port de contrôle** (par défaut `8080`) pour communiquer avec le client.
-  - **Port de service public** (défini par l'utilisateur) pour recevoir le trafic des utilisateurs finaux.
-
-### Flux de Connexion
-
-1. Lorsqu'un utilisateur se connecte au port de service du serveur, celui-ci **n'accepte pas directement** la connexion.
-2. Il notifie le client via la connexion de contrôle.
-3. Le client ouvre une **nouvelle connexion** vers le serveur.
-4. Le client se connecte localement au service cible (ex: `localhost:3000`).
-5. Le serveur relie la connexion utilisateur à celle du client, qui la relie ensuite au service local.
-6. Le trafic TCP peut désormais circuler de bout en bout à travers le tunnel.
-
-Ce mécanisme permet de contourner les limitations des reverse proxies qui ne gèrent que HTTP/HTTPS et ne maintiennent pas de connexions TCP longues.
-
-## 🛠️ Installation
-
-Vous devez avoir **Go** installé sur votre machine.
-
-```sh
-git clone <url-du-repo>
-cd <nom-du-repo>
-go build -o tunnel .
-```
-
 ## 🚀 Utilisation
-
-Le binaire `tunnel` peut fonctionner en mode **serveur** ou **client**.
 
 ### Côté Serveur
 
 Exécutez la commande suivante sur votre serveur public :
 
 ```sh
-./tunnel server [service_port] --log-level [level]
+main.go server [service_port] --log-level [level]
 ```
 
 - `[service_port]` : **(Obligatoire)** Le port TCP public qui recevra le trafic à tunneler.
@@ -68,7 +29,7 @@ Exécutez la commande suivante sur votre serveur public :
 #### Exemple :
 
 ```sh
-./tunnel server 80 --log-level debug
+./tunnel server 4040 --log-level debug
 ```
 
 Le serveur écoutera également les connexions de contrôle sur le port **8080**.
@@ -88,10 +49,10 @@ Exécutez la commande suivante sur la machine hébergeant le service local :
 #### Exemple :
 
 ```sh
-./tunnel client 3000 example.com
+./tunnel client 8080 example.com
 ```
 
-Une fois connecté, tout le trafic envoyé à l’adresse publique sera redirigé vers `localhost:3000`.
+Une fois connecté, tout le trafic envoyé à l’adresse publique sera redirigé vers `localhost:8080`.
 
 En cas de déconnexion, le client tente automatiquement de se reconnecter toutes les 5 secondes.
 
