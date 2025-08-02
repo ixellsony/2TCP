@@ -31,7 +31,7 @@ main.go server [service_port] --log-level [level]
 #### Exemple :
 
 ```sh
-main.go server 4040 --log-level debug
+main.go server 443 --log-level debug
 ```
 
 Le serveur écoutera également les connexions de contrôle sur le port **8080**.
@@ -51,7 +51,7 @@ main.go client [local_port] [server_address] --log-level [level]
 #### Exemple :
 
 ```sh
-main.go client 8080 example.com
+main.go client 443 example.com
 ```
 
 Une fois connecté, tout le trafic envoyé à l’adresse publique sera redirigé vers `localhost:8080`.
