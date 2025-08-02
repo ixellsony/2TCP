@@ -55,15 +55,3 @@ Exécutez la commande suivante sur la machine hébergeant le service local :
 Une fois connecté, tout le trafic envoyé à l’adresse publique sera redirigé vers `localhost:8080`.
 
 En cas de déconnexion, le client tente automatiquement de se reconnecter toutes les 5 secondes.
-
-## 🧪 Health Check
-
-Le serveur peut répondre à une requête `GET /` sur le port de contrôle (8080) avec un `200 OK`, ce qui permet aux reverse proxies ou load balancers de vérifier sa disponibilité.
-
-## 📄 Licence
-
-Ce projet est open-source. Licence à définir selon vos besoins.
-
-## 🤝 Contribuer
-
-Les contributions sont les bienvenues ! N'hésitez pas à ouvrir une issue ou une pull request.
